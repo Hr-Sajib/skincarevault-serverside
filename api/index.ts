@@ -1,42 +1,45 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { createApp } from '../src/app';
-import { connectDB } from '../src/lib/db';
-import { getSettings } from '../src/models/settings.model';
-import { logger } from '../src/lib/logger';
 
 /**
  * Vercel serverless entry point.
  *
- * `src/server.ts` remains the entry for traditional hosting (Railway,
- * Render, or local dev via `npm run dev`) — it owns `app.listen()` and the
- * in-process stock-release interval. Neither of those makes sense here:
- * a serverless function has no persistent process for `setInterval` to run
- * in, so that job is a separate scheduled function — see `api/cron/`.
+ * src/server.ts remains the entry for traditional hosting (Railway, Render,
+ * or local dev via `npm run dev`) -- it owns app.listen() and the in-process
+ * stock-release interval. Neither of those makes sense here: a serverless
+ * function has no persistent process for setInterval to run in, so that job
+ * is a separate scheduled function -- see api/cron/.
  *
- * The Express app itself is exported directly (no `.listen()` call), which
- * is Vercel's documented pattern for Express: it wraps the app as the
- * function's request handler.
+ * Both the Express app construction and the DB connection are deferred into
+ * the handler's try/catch (rather than at module top-level) so that any
+ * synchronous throw during either -- a bad env var, a bad import -- surfaces
+ * as a normal JSON error response instead of Vercel's opaque generic crash
+ * page, which gave no information to debug from.
  */
 
-const app = createApp();
+type ExpressApp = (req: IncomingMessage, res: ServerResponse) => void;
+let appPromise: Promise<ExpressApp> | null = null;
+let dbReady: Promise<void> | null = null;
 
-// Connecting is async, but this module is only ever evaluated once per
-// warm container — the promise is cached so a second invocation on the
-// same container skips straight to an already-open connection.
-let ready: Promise<void> | null = null;
+async function getApp() {
+  if (!appPromise) {
+    appPromise = import('../src/app').then((m) => m.createApp() as unknown as ExpressApp);
+  }
+  return appPromise;
+}
 
-async function ensureReady(): Promise<void> {
-  if (!ready) {
-    ready = connectDB()
-      .then(() => getSettings())
+async function ensureDB() {
+  if (!dbReady) {
+    dbReady = Promise.all([
+      import('../src/lib/db').then((m) => m.connectDB()),
+      import('../src/models/settings.model').then((m) => m.getSettings()),
+    ])
       .then(() => undefined)
       .catch((err) => {
-        // Let the next invocation try again rather than caching a failure.
-        ready = null;
+        dbReady = null;
         throw err;
       });
   }
-  return ready;
+  return dbReady;
 }
 
 export default async function handler(
@@ -44,14 +47,20 @@ export default async function handler(
   res: ServerResponse,
 ): Promise<void> {
   try {
-    await ensureReady();
+    const app = await getApp();
+    await ensureDB();
+    app(req, res);
   } catch (err) {
-    logger.error({ err }, 'Database not ready');
-    res.statusCode = 503;
+    const error = err as Error;
+    res.statusCode = 500;
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ success: false, message: 'Service starting up, please retry.', code: 'DB_NOT_READY' }));
-    return;
+    res.end(
+      JSON.stringify({
+        success: false,
+        code: 'BOOT_FAILED',
+        message: error?.message ?? String(err),
+        stack: error?.stack,
+      }),
+    );
   }
-
-  app(req, res);
 }
