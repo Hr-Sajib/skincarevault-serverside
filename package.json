@@ -12,6 +12,7 @@
     "start": "node dist/server.js",
     "seed": "tsx src/seed/seed.ts",
     "typecheck": "tsc --noEmit",
+    "typecheck:api": "tsc -p tsconfig.api.json --noEmit",
     "test": "vitest run",
     "lint": "eslint src --ext .ts"
   },
